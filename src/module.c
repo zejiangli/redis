@@ -64,6 +64,7 @@ struct AutoMemEntry {
 #define REDISMODULE_AM_STRING 1
 #define REDISMODULE_AM_REPLY 2
 #define REDISMODULE_AM_FREED 3 /* Explicitly freed by user already. */
+#define REDISMODULE_AM_DICT 4
 
 /* The pool allocator block. Redis Modules can allocate memory via this special
  * allocator that will automatically release it all once the callback returns.
@@ -247,6 +248,16 @@ static list *moduleKeyspaceSubscribers;
  * notifications, timers and cluster messages callbacks. */
 static client *moduleFreeContextReusedClient;
 
+/* Data structures related to the exported dictionary data structure. */
+typedef struct RedisModuleDict {
+    rax *rax;                       /* The radix tree. */
+} RedisModuleDict;
+
+typedef struct RedisModuleDictIter {
+    RedisModuleDict *dict;
+    raxIterator ri;
+} RedisModuleDictIter;
+
 /* --------------------------------------------------------------------------
  * Prototypes
  * -------------------------------------------------------------------------- */
@@ -258,6 +269,7 @@ robj **moduleCreateArgvFromUserFormat(const char *cmdname, const char *fmt, int 
 void moduleReplicateMultiIfNeeded(RedisModuleCtx *ctx);
 void RM_ZsetRangeStop(RedisModuleKey *kp);
 static void zsetKeyReset(RedisModuleKey *key);
+void RM_FreeDict(RedisModuleCtx *ctx, RedisModuleDict *d);
 
 /* --------------------------------------------------------------------------
  * Heap allocation raw functions
@@ -672,6 +684,7 @@ int RM_CreateCommand(RedisModuleCtx *ctx, const char *name, RedisModuleCmdFunc c
     cp->rediscmd->calls = 0;
     dictAdd(server.commands,sdsdup(cmdname),cp->rediscmd);
     dictAdd(server.orig_commands,sdsdup(cmdname),cp->rediscmd);
+    cp->rediscmd->id = ACLGetCommandID(cmdname); /* ID used for ACL. */
     return REDISMODULE_OK;
 }
 
@@ -779,6 +792,7 @@ void autoMemoryCollect(RedisModuleCtx *ctx) {
         case REDISMODULE_AM_STRING: decrRefCount(ptr); break;
         case REDISMODULE_AM_REPLY: RM_FreeCallReply(ptr); break;
         case REDISMODULE_AM_KEY: RM_CloseKey(ptr); break;
+        case REDISMODULE_AM_DICT: RM_FreeDict(NULL,ptr); break;
         }
     }
     ctx->flags |= REDISMODULE_CTX_AUTO_MEMORY;
@@ -796,19 +810,26 @@ void autoMemoryCollect(RedisModuleCtx *ctx) {
  * with RedisModule_FreeString(), unless automatic memory is enabled.
  *
  * The string is created by copying the `len` bytes starting
- * at `ptr`. No reference is retained to the passed buffer. */
+ * at `ptr`. No reference is retained to the passed buffer.
+ *
+ * The module context 'ctx' is optional and may be NULL if you want to create
+ * a string out of the context scope. However in that case, the automatic
+ * memory management will not be available, and the string memory must be
+ * managed manually. */
 RedisModuleString *RM_CreateString(RedisModuleCtx *ctx, const char *ptr, size_t len) {
     RedisModuleString *o = createStringObject(ptr,len);
-    autoMemoryAdd(ctx,REDISMODULE_AM_STRING,o);
+    if (ctx != NULL) autoMemoryAdd(ctx,REDISMODULE_AM_STRING,o);
     return o;
 }
-
 
 /* Create a new module string object from a printf format and arguments.
  * The returned string must be freed with RedisModule_FreeString(), unless
  * automatic memory is enabled.
  *
- * The string is created using the sds formatter function sdscatvprintf(). */
+ * The string is created using the sds formatter function sdscatvprintf().
+ *
+ * The passed context 'ctx' may be NULL if necessary, see the
+ * RedisModule_CreateString() documentation for more info. */
 RedisModuleString *RM_CreateStringPrintf(RedisModuleCtx *ctx, const char *fmt, ...) {
     sds s = sdsempty();
 
@@ -818,7 +839,7 @@ RedisModuleString *RM_CreateStringPrintf(RedisModuleCtx *ctx, const char *fmt, .
     va_end(ap);
 
     RedisModuleString *o = createObject(OBJ_STRING, s);
-    autoMemoryAdd(ctx,REDISMODULE_AM_STRING,o);
+    if (ctx != NULL) autoMemoryAdd(ctx,REDISMODULE_AM_STRING,o);
 
     return o;
 }
@@ -828,7 +849,10 @@ RedisModuleString *RM_CreateStringPrintf(RedisModuleCtx *ctx, const char *fmt, .
  * integer instead of taking a buffer and its length.
  *
  * The returned string must be released with RedisModule_FreeString() or by
- * enabling automatic memory management. */
+ * enabling automatic memory management.
+ *
+ * The passed context 'ctx' may be NULL if necessary, see the
+ * RedisModule_CreateString() documentation for more info. */
 RedisModuleString *RM_CreateStringFromLongLong(RedisModuleCtx *ctx, long long ll) {
     char buf[LONG_STR_SIZE];
     size_t len = ll2string(buf,sizeof(buf),ll);
@@ -839,10 +863,13 @@ RedisModuleString *RM_CreateStringFromLongLong(RedisModuleCtx *ctx, long long ll
  * RedisModuleString.
  *
  * The returned string must be released with RedisModule_FreeString() or by
- * enabling automatic memory management. */
+ * enabling automatic memory management.
+ *
+ * The passed context 'ctx' may be NULL if necessary, see the
+ * RedisModule_CreateString() documentation for more info. */
 RedisModuleString *RM_CreateStringFromString(RedisModuleCtx *ctx, const RedisModuleString *str) {
     RedisModuleString *o = dupStringObject(str);
-    autoMemoryAdd(ctx,REDISMODULE_AM_STRING,o);
+    if (ctx != NULL) autoMemoryAdd(ctx,REDISMODULE_AM_STRING,o);
     return o;
 }
 
@@ -851,10 +878,16 @@ RedisModuleString *RM_CreateStringFromString(RedisModuleCtx *ctx, const RedisMod
  *
  * It is possible to call this function even when automatic memory management
  * is enabled. In that case the string will be released ASAP and removed
- * from the pool of string to release at the end. */
+ * from the pool of string to release at the end.
+ *
+ * If the string was created with a NULL context 'ctx', it is also possible to
+ * pass ctx as NULL when releasing the string (but passing a context will not
+ * create any issue). Strings created with a context should be freed also passing
+ * the context, so if you want to free a string out of context later, make sure
+ * to create it using a NULL context. */
 void RM_FreeString(RedisModuleCtx *ctx, RedisModuleString *str) {
     decrRefCount(str);
-    autoMemoryFreed(ctx,REDISMODULE_AM_STRING,str);
+    if (ctx != NULL) autoMemoryFreed(ctx,REDISMODULE_AM_STRING,str);
 }
 
 /* Every call to this function, will make the string 'str' requiring
@@ -878,9 +911,11 @@ void RM_FreeString(RedisModuleCtx *ctx, RedisModuleString *str) {
  * Note that when memory management is turned off, you don't need
  * any call to RetainString() since creating a string will always result
  * into a string that lives after the callback function returns, if
- * no FreeString() call is performed. */
+ * no FreeString() call is performed.
+ *
+ * It is possible to call this function with a NULL context. */
 void RM_RetainString(RedisModuleCtx *ctx, RedisModuleString *str) {
-    if (!autoMemoryFreed(ctx,REDISMODULE_AM_STRING,str)) {
+    if (ctx == NULL || !autoMemoryFreed(ctx,REDISMODULE_AM_STRING,str)) {
         /* Increment the string reference counting only if we can't
          * just remove the object from the list of objects that should
          * be reclaimed. Why we do that, instead of just incrementing
@@ -1089,10 +1124,10 @@ int RM_ReplyWithArray(RedisModuleCtx *ctx, long len) {
         ctx->postponed_arrays = zrealloc(ctx->postponed_arrays,sizeof(void*)*
                 (ctx->postponed_arrays_count+1));
         ctx->postponed_arrays[ctx->postponed_arrays_count] =
-            addDeferredMultiBulkLength(c);
+            addReplyDeferredLen(c);
         ctx->postponed_arrays_count++;
     } else {
-        addReplyMultiBulkLen(c,len);
+        addReplyArrayLen(c,len);
     }
     return REDISMODULE_OK;
 }
@@ -1135,7 +1170,7 @@ void RM_ReplySetArrayLength(RedisModuleCtx *ctx, long len) {
             return;
     }
     ctx->postponed_arrays_count--;
-    setDeferredMultiBulkLength(c,
+    setDeferredArrayLen(c,
             ctx->postponed_arrays[ctx->postponed_arrays_count],
             len);
     if (ctx->postponed_arrays_count == 0) {
@@ -1171,7 +1206,7 @@ int RM_ReplyWithString(RedisModuleCtx *ctx, RedisModuleString *str) {
 int RM_ReplyWithNull(RedisModuleCtx *ctx) {
     client *c = moduleGetReplyClient(ctx);
     if (c == NULL) return REDISMODULE_OK;
-    addReply(c,shared.nullbulk);
+    addReplyNull(c);
     return REDISMODULE_OK;
 }
 
@@ -2662,6 +2697,7 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
     /* Create the client and dispatch the command. */
     va_start(ap, fmt);
     c = createClient(-1);
+    c->user = NULL; /* Root user. */
     argv = moduleCreateArgvFromUserFormat(cmdname,fmt,&argc,&flags,ap);
     replicate = flags & REDISMODULE_ARGV_REPLICATE;
     va_end(ap);
@@ -3635,8 +3671,8 @@ void moduleHandleBlockedClients(void) {
          * free the temporary client we just used for the replies. */
         if (c) {
             if (bc->reply_client->bufpos)
-                addReplyString(c,bc->reply_client->buf,
-                                 bc->reply_client->bufpos);
+                addReplyProto(c,bc->reply_client->buf,
+                                bc->reply_client->bufpos);
             if (listLength(bc->reply_client->reply))
                 listJoin(c->reply,bc->reply_client->reply);
             c->reply_bytes += bc->reply_client->reply_bytes;
@@ -4187,6 +4223,7 @@ typedef struct RedisModuleTimer {
     RedisModule *module;                /* Module reference. */
     RedisModuleTimerProc callback;      /* The callback to invoke on expire. */
     void *data;                         /* Private data for the callback. */
+    int dbid;                           /* Database number selected by the original client. */
 } RedisModuleTimer;
 
 /* This is the timer handler that is called by the main event loop. We schedule
@@ -4213,7 +4250,7 @@ int moduleTimerHandler(struct aeEventLoop *eventLoop, long long id, void *client
 
             ctx.module = timer->module;
             ctx.client = moduleFreeContextReusedClient;
-            selectDb(ctx.client, 0);
+            selectDb(ctx.client, timer->dbid);
             timer->callback(&ctx,timer->data);
             moduleFreeContext(&ctx);
             raxRemove(Timers,(unsigned char*)ri.key,ri.key_len,NULL);
@@ -4238,6 +4275,7 @@ RedisModuleTimerID RM_CreateTimer(RedisModuleCtx *ctx, mstime_t period, RedisMod
     timer->module = ctx->module;
     timer->callback = callback;
     timer->data = data;
+    timer->dbid = ctx->client->db->id;
     uint64_t expiretime = ustime()+period*1000;
     uint64_t key;
 
@@ -4310,6 +4348,257 @@ int RM_GetTimerInfo(RedisModuleCtx *ctx, RedisModuleTimerID id, uint64_t *remain
 }
 
 /* --------------------------------------------------------------------------
+ * Modules Dictionary API
+ *
+ * Implements a sorted dictionary (actually backed by a radix tree) with
+ * the usual get / set / del / num-items API, together with an iterator
+ * capable of going back and forth.
+ * -------------------------------------------------------------------------- */
+
+/* Create a new dictionary. The 'ctx' pointer can be the current module context
+ * or NULL, depending on what you want. Please follow the following rules:
+ *
+ * 1. Use a NULL context if you plan to retain a reference to this dictionary
+ *    that will survive the time of the module callback where you created it.
+ * 2. Use a NULL context if no context is available at the time you are creating
+ *    the dictionary (of course...).
+ * 3. However use the current callback context as 'ctx' argument if the
+ *    dictionary time to live is just limited to the callback scope. In this
+ *    case, if enabled, you can enjoy the automatic memory management that will
+ *    reclaim the dictionary memory, as well as the strings returned by the
+ *    Next / Prev dictionary iterator calls.
+ */
+RedisModuleDict *RM_CreateDict(RedisModuleCtx *ctx) {
+    struct RedisModuleDict *d = zmalloc(sizeof(*d));
+    d->rax = raxNew();
+    if (ctx != NULL) autoMemoryAdd(ctx,REDISMODULE_AM_DICT,d);
+    return d;
+}
+
+/* Free a dictionary created with RM_CreateDict(). You need to pass the
+ * context pointer 'ctx' only if the dictionary was created using the
+ * context instead of passing NULL. */
+void RM_FreeDict(RedisModuleCtx *ctx, RedisModuleDict *d) {
+    if (ctx != NULL) autoMemoryFreed(ctx,REDISMODULE_AM_DICT,d);
+    raxFree(d->rax);
+    zfree(d);
+}
+
+/* Return the size of the dictionary (number of keys). */
+uint64_t RM_DictSize(RedisModuleDict *d) {
+    return raxSize(d->rax);
+}
+
+/* Store the specified key into the dictionary, setting its value to the
+ * pointer 'ptr'. If the key was added with success, since it did not
+ * already exist, REDISMODULE_OK is returned. Otherwise if the key already
+ * exists the function returns REDISMODULE_ERR. */
+int RM_DictSetC(RedisModuleDict *d, void *key, size_t keylen, void *ptr) {
+    int retval = raxTryInsert(d->rax,key,keylen,ptr,NULL);
+    return (retval == 1) ? REDISMODULE_OK : REDISMODULE_ERR;
+}
+
+/* Like RedisModule_DictSetC() but will replace the key with the new
+ * value if the key already exists. */
+int RM_DictReplaceC(RedisModuleDict *d, void *key, size_t keylen, void *ptr) {
+    int retval = raxInsert(d->rax,key,keylen,ptr,NULL);
+    return (retval == 1) ? REDISMODULE_OK : REDISMODULE_ERR;
+}
+
+/* Like RedisModule_DictSetC() but takes the key as a RedisModuleString. */
+int RM_DictSet(RedisModuleDict *d, RedisModuleString *key, void *ptr) {
+    return RM_DictSetC(d,key->ptr,sdslen(key->ptr),ptr);
+}
+
+/* Like RedisModule_DictReplaceC() but takes the key as a RedisModuleString. */
+int RM_DictReplace(RedisModuleDict *d, RedisModuleString *key, void *ptr) {
+    return RM_DictReplaceC(d,key->ptr,sdslen(key->ptr),ptr);
+}
+
+/* Return the value stored at the specified key. The function returns NULL
+ * both in the case the key does not exist, or if you actually stored
+ * NULL at key. So, optionally, if the 'nokey' pointer is not NULL, it will
+ * be set by reference to 1 if the key does not exist, or to 0 if the key
+ * exists. */
+void *RM_DictGetC(RedisModuleDict *d, void *key, size_t keylen, int *nokey) {
+    void *res = raxFind(d->rax,key,keylen);
+    if (nokey) *nokey = (res == raxNotFound);
+    return (res == raxNotFound) ? NULL : res;
+}
+
+/* Like RedisModule_DictGetC() but takes the key as a RedisModuleString. */
+void *RM_DictGet(RedisModuleDict *d, RedisModuleString *key, int *nokey) {
+    return RM_DictGetC(d,key->ptr,sdslen(key->ptr),nokey);
+}
+
+/* Remove the specified key from the dictionary, returning REDISMODULE_OK if
+ * the key was found and delted, or REDISMODULE_ERR if instead there was
+ * no such key in the dictionary. When the operation is successful, if
+ * 'oldval' is not NULL, then '*oldval' is set to the value stored at the
+ * key before it was deleted. Using this feature it is possible to get
+ * a pointer to the value (for instance in order to release it), without
+ * having to call RedisModule_DictGet() before deleting the key. */
+int RM_DictDelC(RedisModuleDict *d, void *key, size_t keylen, void *oldval) {
+    int retval = raxRemove(d->rax,key,keylen,oldval);
+    return retval ? REDISMODULE_OK : REDISMODULE_ERR;
+}
+
+/* Like RedisModule_DictDelC() but gets the key as a RedisModuleString. */
+int RM_DictDel(RedisModuleDict *d, RedisModuleString *key, void *oldval) {
+    return RM_DictDelC(d,key->ptr,sdslen(key->ptr),oldval);
+}
+
+/* Return an interator, setup in order to start iterating from the specified
+ * key by applying the operator 'op', which is just a string specifying the
+ * comparison operator to use in order to seek the first element. The
+ * operators avalable are:
+ *
+ * "^"   -- Seek the first (lexicographically smaller) key.
+ * "$"   -- Seek the last  (lexicographically biffer) key.
+ * ">"   -- Seek the first element greter than the specified key.
+ * ">="  -- Seek the first element greater or equal than the specified key.
+ * "<"   -- Seek the first element smaller than the specified key.
+ * "<="  -- Seek the first element smaller or equal than the specified key.
+ * "=="  -- Seek the first element matching exactly the specified key.
+ *
+ * Note that for "^" and "$" the passed key is not used, and the user may
+ * just pass NULL with a length of 0.
+ *
+ * If the element to start the iteration cannot be seeked based on the
+ * key and operator passed, RedisModule_DictNext() / Prev() will just return
+ * REDISMODULE_ERR at the first call, otherwise they'll produce elements.
+ */
+RedisModuleDictIter *RM_DictIteratorStartC(RedisModuleDict *d, const char *op, void *key, size_t keylen) {
+    RedisModuleDictIter *di = zmalloc(sizeof(*di));
+    di->dict = d;
+    raxStart(&di->ri,d->rax);
+    raxSeek(&di->ri,op,key,keylen);
+    return di;
+}
+
+/* Exactly like RedisModule_DictIteratorStartC, but the key is passed as a
+ * RedisModuleString. */
+RedisModuleDictIter *RM_DictIteratorStart(RedisModuleDict *d, const char *op, RedisModuleString *key) {
+    return RM_DictIteratorStartC(d,op,key->ptr,sdslen(key->ptr));
+}
+
+/* Release the iterator created with RedisModule_DictIteratorStart(). This call
+ * is mandatory otherwise a memory leak is introduced in the module. */
+void RM_DictIteratorStop(RedisModuleDictIter *di) {
+    raxStop(&di->ri);
+    zfree(di);
+}
+
+/* After its creation with RedisModule_DictIteratorStart(), it is possible to
+ * change the currently selected element of the iterator by using this
+ * API call. The result based on the operator and key is exactly like
+ * the function RedisModule_DictIteratorStart(), however in this case the
+ * return value is just REDISMODULE_OK in case the seeked element was found,
+ * or REDISMODULE_ERR in case it was not possible to seek the specified
+ * element. It is possible to reseek an iterator as many times as you want. */
+int RM_DictIteratorReseekC(RedisModuleDictIter *di, const char *op, void *key, size_t keylen) {
+    return raxSeek(&di->ri,op,key,keylen);
+}
+
+/* Like RedisModule_DictIteratorReseekC() but takes the key as as a
+ * RedisModuleString. */
+int RM_DictIteratorReseek(RedisModuleDictIter *di, const char *op, RedisModuleString *key) {
+    return RM_DictIteratorReseekC(di,op,key->ptr,sdslen(key->ptr));
+}
+
+/* Return the current item of the dictionary iterator 'di' and steps to the
+ * next element. If the iterator already yield the last element and there
+ * are no other elements to return, NULL is returned, otherwise a pointer
+ * to a string representing the key is provided, and the '*keylen' length
+ * is set by reference (if keylen is not NULL). The '*dataptr', if not NULL
+ * is set to the value of the pointer stored at the returned key as auxiliary
+ * data (as set by the RedisModule_DictSet API).
+ *
+ * Usage example:
+ *
+ *      ... create the iterator here ...
+ *      char *key;
+ *      void *data;
+ *      while((key = RedisModule_DictNextC(iter,&keylen,&data)) != NULL) {
+ *          printf("%.*s %p\n", (int)keylen, key, data);
+ *      }
+ *
+ * The returned pointer is of type void because sometimes it makes sense
+ * to cast it to a char* sometimes to an unsigned char* depending on the
+ * fact it contains or not binary data, so this API ends being more
+ * comfortable to use.
+ *
+ * The validity of the returned pointer is until the next call to the
+ * next/prev iterator step. Also the pointer is no longer valid once the
+ * iterator is released. */
+void *RM_DictNextC(RedisModuleDictIter *di, size_t *keylen, void **dataptr) {
+    if (!raxNext(&di->ri)) return NULL;
+    if (keylen) *keylen = di->ri.key_len;
+    if (dataptr) *dataptr = di->ri.data;
+    return di->ri.key;
+}
+
+/* This function is exactly like RedisModule_DictNext() but after returning
+ * the currently selected element in the iterator, it selects the previous
+ * element (laxicographically smaller) instead of the next one. */
+void *RM_DictPrevC(RedisModuleDictIter *di, size_t *keylen, void **dataptr) {
+    if (!raxPrev(&di->ri)) return NULL;
+    if (keylen) *keylen = di->ri.key_len;
+    if (dataptr) *dataptr = di->ri.data;
+    return di->ri.key;
+}
+
+/* Like RedisModuleNextC(), but instead of returning an internally allocated
+ * buffer and key length, it returns directly a module string object allocated
+ * in the specified context 'ctx' (that may be NULL exactly like for the main
+ * API RedisModule_CreateString).
+ *
+ * The returned string object should be deallocated after use, either manually
+ * or by using a context that has automatic memory management active. */
+RedisModuleString *RM_DictNext(RedisModuleCtx *ctx, RedisModuleDictIter *di, void **dataptr) {
+    size_t keylen;
+    void *key = RM_DictNextC(di,&keylen,dataptr);
+    if (key == NULL) return NULL;
+    return RM_CreateString(ctx,key,keylen);
+}
+
+/* Like RedisModule_DictNext() but after returning the currently selected
+ * element in the iterator, it selects the previous element (laxicographically
+ * smaller) instead of the next one. */
+RedisModuleString *RM_DictPrev(RedisModuleCtx *ctx, RedisModuleDictIter *di, void **dataptr) {
+    size_t keylen;
+    void *key = RM_DictPrevC(di,&keylen,dataptr);
+    if (key == NULL) return NULL;
+    return RM_CreateString(ctx,key,keylen);
+}
+
+/* Compare the element currently pointed by the iterator to the specified
+ * element given by key/keylen, according to the operator 'op' (the set of
+ * valid operators are the same valid for RedisModule_DictIteratorStart).
+ * If the comparision is successful the command returns REDISMODULE_OK
+ * otherwise REDISMODULE_ERR is returned.
+ *
+ * This is useful when we want to just emit a lexicographical range, so
+ * in the loop, as we iterate elements, we can also check if we are still
+ * on range.
+ *
+ * The function returne REDISMODULE_ERR if the iterator reached the
+ * end of elements condition as well. */
+int RM_DictCompareC(RedisModuleDictIter *di, const char *op, void *key, size_t keylen) {
+    if (raxEOF(&di->ri)) return REDISMODULE_ERR;
+    int res = raxCompare(&di->ri,op,key,keylen);
+    return res ? REDISMODULE_OK : REDISMODULE_ERR;
+}
+
+/* Like RedisModule_DictCompareC but gets the key to compare with the current
+ * iterator key as a RedisModuleString. */
+int RM_DictCompare(RedisModuleDictIter *di, const char *op, RedisModuleString *key) {
+    if (raxEOF(&di->ri)) return REDISMODULE_ERR;
+    int res = raxCompare(&di->ri,op,key->ptr,sdslen(key->ptr));
+    return res ? REDISMODULE_OK : REDISMODULE_ERR;
+}
+
+/* --------------------------------------------------------------------------
  * Modules utility APIs
  * -------------------------------------------------------------------------- */
 
@@ -4372,6 +4661,7 @@ void moduleInitModulesSystem(void) {
     moduleKeyspaceSubscribers = listCreate();
     moduleFreeContextReusedClient = createClient(-1);
     moduleFreeContextReusedClient->flags |= CLIENT_MODULE;
+    moduleFreeContextReusedClient->user = NULL; /* root user. */
 
     moduleRegisterCoreAPI();
     if (pipe(server.module_blocked_pipe) == -1) {
@@ -4531,6 +4821,25 @@ int moduleUnload(sds name) {
     return REDISMODULE_OK;
 }
 
+/* Helper function for the MODULE and HELLO command: send the list of the
+ * loaded modules to the client. */
+void addReplyLoadedModules(client *c) {
+    dictIterator *di = dictGetIterator(modules);
+    dictEntry *de;
+
+    addReplyArrayLen(c,dictSize(modules));
+    while ((de = dictNext(di)) != NULL) {
+        sds name = dictGetKey(de);
+        struct RedisModule *module = dictGetVal(de);
+        addReplyMapLen(c,2);
+        addReplyBulkCString(c,"name");
+        addReplyBulkCBuffer(c,name,sdslen(name));
+        addReplyBulkCString(c,"ver");
+        addReplyLongLong(c,module->ver);
+    }
+    dictReleaseIterator(di);
+}
+
 /* Redis MODULE command.
  *
  * MODULE LOAD <path> [args...] */
@@ -4578,20 +4887,7 @@ NULL
             addReplyErrorFormat(c,"Error unloading module: %s",errmsg);
         }
     } else if (!strcasecmp(subcmd,"list") && c->argc == 2) {
-        dictIterator *di = dictGetIterator(modules);
-        dictEntry *de;
-
-        addReplyMultiBulkLen(c,dictSize(modules));
-        while ((de = dictNext(di)) != NULL) {
-            sds name = dictGetKey(de);
-            struct RedisModule *module = dictGetVal(de);
-            addReplyMultiBulkLen(c,4);
-            addReplyBulkCString(c,"name");
-            addReplyBulkCBuffer(c,name,sdslen(name));
-            addReplyBulkCString(c,"ver");
-            addReplyLongLong(c,module->ver);
-        }
-        dictReleaseIterator(di);
+        addReplyLoadedModules(c);
     } else {
         addReplySubcommandSyntaxError(c);
         return;
@@ -4735,4 +5031,26 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(SetDisconnectCallback);
     REGISTER_API(GetBlockedClientHandle);
     REGISTER_API(SetClusterFlags);
+    REGISTER_API(CreateDict);
+    REGISTER_API(FreeDict);
+    REGISTER_API(DictSize);
+    REGISTER_API(DictSetC);
+    REGISTER_API(DictReplaceC);
+    REGISTER_API(DictSet);
+    REGISTER_API(DictReplace);
+    REGISTER_API(DictGetC);
+    REGISTER_API(DictGet);
+    REGISTER_API(DictDelC);
+    REGISTER_API(DictDel);
+    REGISTER_API(DictIteratorStartC);
+    REGISTER_API(DictIteratorStart);
+    REGISTER_API(DictIteratorStop);
+    REGISTER_API(DictIteratorReseekC);
+    REGISTER_API(DictIteratorReseek);
+    REGISTER_API(DictNextC);
+    REGISTER_API(DictPrevC);
+    REGISTER_API(DictNext);
+    REGISTER_API(DictPrev);
+    REGISTER_API(DictCompareC);
+    REGISTER_API(DictCompare);
 }
